@@ -3,6 +3,9 @@ defmodule Encryption.User do
   import Ecto.Changeset
   alias Encryption.{User, Repo, HashField, EncryptedField, PasswordField}
 
+  # Map inputs to outputs for the HashFields and PasswordFields
+  @field_source_map [email_hash: :email, password_hash: :password]
+
   schema "users" do
     # :binary
     field(:email_hash, HashField)
@@ -25,7 +28,7 @@ defmodule Encryption.User do
   """
   def changeset(%User{} = user, attrs \\ %{}) do
     # hash and/or encrypt the personal data before db insert!
-    #  only after the email has been hashed!
+    # only after the email has been hashed!
     user
     |> Map.merge(attrs)
     |> cast(attrs, [:name, :email])
@@ -34,54 +37,39 @@ defmodule Encryption.User do
     |> unique_constraint(:email_hash)
   end
 
-  # prepare_fields/1 takes changeset and applies the reuired "dump" function.
-  defp prepare_fields(changeset) do
-    #  don't bother transforming the data if invalid.
-    case changeset.valid? do
-      true ->
-        # get name of Ecto Struct. e.g: User
-        struct = changeset.data.__struct__
-        # get list of fields in the Struct
-        fields = struct.__schema__(:fields)
-        # create map of data transforms stackoverflow.com/a/29924465/1148249
-        changes =
-          Enum.reduce(fields, %{}, fn field, acc ->
-            type = struct.__schema__(:type, field)
-            # only check the changeset if it's "valid" and
-            if String.contains?(Atom.to_string(type), "Encryption.") do
-              primary =
-                case type do
-                  # "priary" field for :email_hash is :email
-                  Encryption.HashField ->
-                    :email
+  # prepare_fields/1 takes changeset and applies the required "dump" function.
+  # only apply the "dump" function if the changeset is valid
+  defp prepare_fields(%Ecto.Changeset{valid?: true} = changeset) do
+    # 1) get each field and their respective type
+    # 2) check if the type is a custom type (see is_custom_type?/1)
+    # 3) if it is a custom type, check @field_source_map to see which field
+    #    supplies the input data
+    # 4) proceed to apply `dump/1` to transform the data into the final value
 
-                  Encryption.PasswordField ->
-                    :password
+    changes =
+      Enum.reduce(changeset.types, %{}, fn {field, type}, accumulator ->
+        case is_custom_type?(type) do
+          true ->
+            data_source = Keyword.get(@field_source_map, field, field)
+            data = Map.get(changeset.data, data_source)
 
-                  _ ->
-                    field
-                end
+            {:ok, transformed_value} = Kernel.apply(type, :dump, [data])
+            Map.put(accumulator, field, transformed_value)
 
-              # get plaintext data
-              data = Map.get(changeset.data, primary)
-              # dump (encrypt/hash)
-              {:ok, transformed_value} = type.dump(data)
-              # assign key:value to Map
-              Map.put(acc, field, transformed_value)
-            else
-              # always return the accumulator to avoid "nil is not a map!"
-              acc
-            end
-          end)
+          false ->
+            accumulator
+        end
+      end)
 
-        #  apply the changes to the changeset
-        %{changeset | changes: changes}
-
-      _ ->
-        # return the changeset unmodified for the next function in pipe
-        changeset
-    end
+    # 5) apply the transformations to the changeset
+    %{changeset | changes: changes}
   end
+
+  # do not transform the data if it's invalid
+  defp prepare_fields(changeset), do: changeset
+
+  # Check whether the type is a custom type.
+  defp is_custom_type?(type), do: function_exported?(type, :dump, 1)
 
   @doc """
   Retrieve one user from the database and decrypt the encrypted data.
@@ -120,13 +108,5 @@ defmodule Encryption.User do
         {:ok, name} = EncryptedField.load(name, key_id)
         {:ok, %{user | email: email, name: name, password_hash: password_hash}}
     end
-  end
-end
-
-defmodule Util do
-  types = ~w[function nil integer binary bitstring list map float atom tuple pid port reference]
-
-  for type <- types do
-    def typeof(x) when unquote(:"is_#{type}")(x), do: unquote(type)
   end
 end
